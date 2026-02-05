@@ -41,17 +41,22 @@ DEFAULT_OUTPUT = _ROOT / "data" / "dataset_v1"
 MODEL_DIR = _ROOT / "data" / "models"
 IMG_SIZE = 512
 
-# Profile filter: profile cascade primary, MediaPipe fallback.
-# Tuned for ~100 side profiles (50 patients × Before/After).
-MAX_INTER_OCULAR_RATIO = 0.40   # Cascade path
-MIN_NOSE_TO_EYE_RATIO = 1.55
-MIN_YAW_DEG = 30.0
-MAX_IO_FALLBACK = 0.36          # MediaPipe-only fallback
-MIN_NOSE_EYE_FALLBACK = 1.8
-MIN_YAW_FALLBACK = 35.0
+# Profile filter: STRICT side profiles only (rejects 3/4 views).
+# True side profile: one eye occluded, nose perpendicular to camera.
+# 3/4 profile: both eyes visible, yaw ~45° → REJECT these.
+MAX_INTER_OCULAR_RATIO = 0.22   # Side: <0.22 (eyes overlap/occluded). 3/4: 0.30-0.45
+MIN_NOSE_TO_EYE_RATIO = 2.5     # Side: >2.5 (far eye hidden). 3/4: 1.3-1.8
+MIN_YAW_DEG = 55.0              # Side: 70-90°. 3/4: 30-50°. Threshold at 55°.
+MAX_IO_FALLBACK = 0.20          # MediaPipe-only fallback (stricter)
+MIN_NOSE_EYE_FALLBACK = 2.8     # MediaPipe-only fallback (stricter)
+MIN_YAW_FALLBACK = 60.0         # MediaPipe-only fallback (stricter)
 
 # Quality
 BLUR_VAR_THRESHOLD = 5.0
+# Reject ear-only / partial crops (profile cascade can fire on ears)
+# MIN_FACE_IN_CROP=False: MediaPipe often fails on side profiles (frontal bias) → was causing Kept:0
+MIN_PROFILE_BBOX_PX = 70    # Cascade bbox min dimension; ears give tiny bboxes (~50); real profiles ~100+
+MIN_FACE_IN_CROP = False    # MediaPipe fails on side-profile crops; use bbox size filter instead
 FACE_LANDMARKER_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/"
     "float16/1/face_landmarker.task"
@@ -255,6 +260,12 @@ def detect_profile_face(image: np.ndarray, high_recall: bool = False) -> tuple[i
         return (x, fy, fw, fh)
     x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
     return (x, y, w, h)
+
+
+def has_face_in_crop(cropped: np.ndarray) -> bool:
+    """True if MediaPipe detects a face in the crop. Rejects ear-only / partial crops."""
+    lm, _ = detect_face_and_landmarks(cropped)
+    return lm is not None
 
 
 def count_visible_eyes(image: np.ndarray) -> int:
@@ -567,6 +578,10 @@ def process_image(
 
     if not allow_frontal:
         profile_bbox = detect_profile_face(img)
+        if profile_bbox is not None:
+            x, y, bw, bh = profile_bbox
+            if min(bw, bh) < MIN_PROFILE_BBOX_PX:
+                return False, None, "not_profile", None  # Ear-only; bbox too small
         lm, _ = detect_face_and_landmarks(img)
         if profile_bbox is not None:
             # Path 1: cascade found – lenient landmark filter
@@ -613,6 +628,8 @@ def process_image(
             aligned = cv2.flip(aligned, 1)
     if aligned is None:
         return False, None, "crop_failed", None
+    if MIN_FACE_IN_CROP and not allow_frontal and not has_face_in_crop(aligned):
+        return False, None, "no_face_in_crop", None  # Ear-only / partial; reject
 
     patient_id = infer_patient_id(img_path, input_root)
     out_dir = output_root / patient_id
@@ -661,8 +678,10 @@ def run(
             images.append((p, rel))
 
     log.info("Found %d images in %s", len(images), input_dir)
+    if len(images) == 0:
+        log.warning("No images found. Check input path. Try: ./data/clean_dataset or ./data/raw_downloads/asps")
     metadata_rows: list[dict] = []
-    stats: dict[str, int] = {"kept": 0, "unreadable": 0, "blurry": 0, "no_face": 0, "not_profile": 0, "no_time_parsed": 0, "crop_failed": 0}
+    stats: dict[str, int] = {"kept": 0, "unreadable": 0, "blurry": 0, "no_face": 0, "not_profile": 0, "no_time_parsed": 0, "crop_failed": 0, "no_face_in_crop": 0}
 
     for i, (abs_path, rel_path) in enumerate(images):
         if (i + 1) % 25 == 0 or i == 0:
@@ -729,19 +748,19 @@ def main() -> None:
         "--min-yaw",
         type=float,
         default=MIN_YAW_DEG,
-        help="Min yaw (degrees). Default 40.",
+        help="Min yaw (degrees). Default 55. True side profiles are 70-90°.",
     )
     ap.add_argument(
         "--max-io-ratio",
         type=float,
         default=MAX_INTER_OCULAR_RATIO,
-        help="Max inter-ocular / face size. Default 0.38.",
+        help="Max inter-ocular / face size. Default 0.22. 3/4 views are 0.30-0.45.",
     )
     ap.add_argument(
         "--min-nose-eye-ratio",
         type=float,
         default=MIN_NOSE_TO_EYE_RATIO,
-        help="Min nose-to-eye ratio (far/near). Side: >=2. 3/4: ~1.5. Default 2.0.",
+        help="Min nose-to-eye ratio (far/near). Default 2.5. 3/4 views are 1.3-1.8.",
     )
     ap.add_argument(
         "--flip",
@@ -751,7 +770,7 @@ def main() -> None:
     ap.add_argument(
         "--loose",
         action="store_true",
-        help="Loosen profile filter (max-io 0.30, min-nose-eye 1.9). May include some 3/4.",
+        help="Loosen profile filter (max-io 0.30, min-nose-eye 2.0, yaw 40°, no eye check). May include some 3/4.",
     )
     ap.add_argument(
         "--high-recall",
@@ -760,9 +779,10 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    min_yaw = 30.0 if args.loose else args.min_yaw
-    max_io_ratio = 0.42 if args.loose else args.max_io_ratio
-    min_nose_eye_ratio = 1.5 if args.loose else args.min_nose_eye_ratio
+    min_yaw = 40.0 if args.loose else args.min_yaw
+    max_io_ratio = 0.30 if args.loose else args.max_io_ratio
+    min_nose_eye_ratio = 2.0 if args.loose else args.min_nose_eye_ratio
+    # Eye count unreliable (shadows, ear shadows). Disable to restore side-profile recall.
     require_single_eye = False
     high_recall = args.high_recall
     use_loose_fallback = args.loose
