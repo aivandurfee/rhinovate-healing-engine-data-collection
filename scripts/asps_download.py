@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shutil
 import sys
@@ -226,8 +227,8 @@ def _normalize_image_url(url: str, prefer_full_res: bool = True) -> str:
     return u
 
 
-def _download_image(url: str, dest: Path, session) -> bool:
-    """Download a single image to dest. Tries full-res first, then _scaled. Returns True on success."""
+def _download_image_bytes(url: str, session) -> bytes | None:
+    """Download image to bytes. Returns None on failure. Used for content dedup."""
     candidates = [_normalize_image_url(url, prefer_full_res=True), url]
     if url not in candidates:
         candidates.append(url)
@@ -237,12 +238,9 @@ def _download_image(url: str, dest: Path, session) -> bool:
             try:
                 r = session.get(try_url, timeout=30, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(r.content)
-                return True
+                return r.content
             except Exception as e:
                 last_err = e
-                # If 404 and we tried full-res, fall back to next candidate (e.g. _scaled)
                 if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 404:
                     break
                 if attempt < MAX_RETRIES - 1:
@@ -251,13 +249,49 @@ def _download_image(url: str, dest: Path, session) -> bool:
             continue
         continue
     print(f"    Download failed: {url[:80]}... – {last_err}", file=sys.stderr)
-    return False
+    return None
+
+
+def _content_hash(data: bytes) -> str:
+    """MD5 hash of image bytes for duplicate detection."""
+    return hashlib.md5(data).hexdigest()
+
+
+# ASPS URL pattern: ...-{img_id}b... or ...-{img_id}a... (e.g. case-35135-101964a_scaled.jpg)
+_IMG_ID_PATTERN = re.compile(r"[_-](\d+)([ab])[_.]", re.I)
+
+
+def _image_id_from_url(url: str) -> str | None:
+    """Extract unique image ID (e.g. '101964a') from ASPS URL. Same ID = same image."""
+    m = _IMG_ID_PATTERN.search(url)
+    if not m:
+        return None
+    return f"{m.group(1)}{m.group(2).lower()}"
+
+
+def _dedupe_urls_by_image_id(urls: list[str], prefer_full_res: bool = True) -> list[str]:
+    """
+    Keep one URL per unique image. ASPS serves same image at multiple URLs
+    (e.g. _scaled.jpg and .jpg, or from img + a href). Dedupe by image ID.
+    Prefer full-res (no _scaled) when prefer_full_res.
+    """
+    by_id: dict[str, str] = {}
+    for url in urls:
+        img_id = _image_id_from_url(url)
+        if not img_id:
+            continue
+        if img_id not in by_id:
+            by_id[img_id] = url
+        elif prefer_full_res and "_scaled" in by_id[img_id] and "_scaled" not in url:
+            by_id[img_id] = url  # Prefer full-res
+    return list(by_id.values())
 
 
 def _extract_before_after_urls(driver) -> tuple[list[str], list[str]]:
     """
     On a case page, find all image URLs and classify into before (b) and after (a)
     based on ASPS filename convention: *b_scaled.jpg / *b.jpg = before, *a_* = after.
+    Deduplicates by image ID so same image (different URLs) is only downloaded once.
     Returns (before_urls, after_urls).
     """
     before_urls: list[str] = []
@@ -269,18 +303,15 @@ def _extract_before_after_urls(driver) -> tuple[list[str], list[str]]:
         src = img.get_attribute("data-src") or img.get_attribute("src") or ""
         if "photogallery" not in src or "plasticsurgery" not in src:
             continue
-        # Normalize: ensure we use https and full host
         if src.startswith("//"):
             src = "https:" + src
         if "www1.plasticsurgery.org" not in src and "plasticsurgery.org" in src:
             src = src.replace("www.plasticsurgery.org", "www1.plasticsurgery.org", 1)
-        # ASPS convention: ...-101964b_scaled.jpg = before, ...-101964a_scaled.jpg = after
         if re.search(r"[_-](\d+)b[_.]", src, re.I):
             before_urls.append(src)
         elif re.search(r"[_-](\d+)a[_.]", src, re.I):
             after_urls.append(src)
 
-    # Also check <a href="..."> linking to image URLs (e.g. lightbox links)
     for a in driver.find_elements(By.TAG_NAME, "a"):
         href = a.get_attribute("href") or ""
         if "photogallery" not in href or "plasticsurgery" not in href:
@@ -292,9 +323,11 @@ def _extract_before_after_urls(driver) -> tuple[list[str], list[str]]:
         elif re.search(r"[_-](\d+)a[_.]", href, re.I):
             after_urls.append(href)
 
-    # Deduplicate while preserving order
+    # Dedupe by URL first, then by image ID (same image, different URLs)
     before_urls = list(dict.fromkeys(before_urls))
     after_urls = list(dict.fromkeys(after_urls))
+    before_urls = _dedupe_urls_by_image_id(before_urls)
+    after_urls = _dedupe_urls_by_image_id(after_urls)
     return before_urls, after_urls
 
 
@@ -334,26 +367,32 @@ def _scrape_case(
     raw_before = raw_dir / case_id / "Before"
     raw_after = raw_dir / case_id / "After"
 
-    # Download each image once to clean path, then copy to raw (avoids double HTTP fetch)
-    saved = 0
-    for i, url in enumerate(before_urls):
-        ext = ".jpg" if ".jpg" in url.split("?")[0] else ".png"
-        name = f"{(i+1):02d}_before{ext}"
-        clean_path = clean_before / name
-        raw_path = raw_before / name
-        if _download_image(url, clean_path, session):
+    # Download each image; deduplicate by content hash (ASPS often serves same image under different URLs)
+    def _download_dedup(urls: list[str], clean_dir: Path, raw_dir: Path, suffix: str) -> int:
+        seen_hashes: set[str] = set()
+        saved = 0
+        for url in urls:
+            data = _download_image_bytes(url, session)
+            if data is None:
+                continue
+            h = _content_hash(data)
+            if h in seen_hashes:
+                continue
+            seen_hashes.add(h)
             saved += 1
+            ext = ".jpg" if ".jpg" in url.split("?")[0] else ".png"
+            name = f"{saved:02d}_{suffix}{ext}"
+            clean_path = clean_dir / name
+            raw_path = raw_dir / name
+            clean_path.parent.mkdir(parents=True, exist_ok=True)
             raw_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(clean_path, raw_path)
-    for i, url in enumerate(after_urls):
-        ext = ".jpg" if ".jpg" in url.split("?")[0] else ".png"
-        name = f"{(i+1):02d}_after{ext}"
-        clean_path = clean_after / name
-        raw_path = raw_after / name
-        if _download_image(url, clean_path, session):
-            saved += 1
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(clean_path, raw_path)
+            clean_path.write_bytes(data)
+            raw_path.write_bytes(data)
+        return saved
+
+    saved_before = _download_dedup(before_urls, clean_before, raw_before, "before")
+    saved_after = _download_dedup(after_urls, clean_after, raw_after, "after")
+    saved = saved_before + saved_after
 
     if saved:
         print(f"  Case {case_id}: saved {saved} images -> {patient_id}/Before|After")

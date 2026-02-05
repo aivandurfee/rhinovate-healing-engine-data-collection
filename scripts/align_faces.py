@@ -102,40 +102,36 @@ def get_landmarks(image: np.ndarray):
 
 
 def align_and_crop(image: np.ndarray, nose, left_eye, right_eye) -> np.ndarray:
-    """Rotate (eyes horizontal), then crop 512×512 centered on nose. Pads if needed."""
-    dy = right_eye[1] - left_eye[1]
-    dx = right_eye[0] - left_eye[0]
-    angle = math.degrees(math.atan2(dy, dx))
-    M = cv2.getRotationMatrix2D(tuple(nose), angle, 1.0)
+    """Rotate around eye center, scale to standardize eye distance, place nose at 40% from top."""
     h, w = image.shape[:2]
-    rotated = cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
 
-    half = IMG_SIZE // 2
-    x1 = nose[0] - half
-    x2 = nose[0] + half
-    y1 = nose[1] - half
-    y2 = nose[1] + half
+    dx = right_eye[0] - left_eye[0]
+    dy = right_eye[1] - left_eye[1]
+    angle = math.degrees(math.atan2(dy, dx))
 
-    pad_l = max(0, -x1)
-    pad_r = max(0, x2 - w)
-    pad_t = max(0, -y1)
-    pad_b = max(0, y2 - h)
-    if pad_l or pad_r or pad_t or pad_b:
-        rotated = cv2.copyMakeBorder(
-            rotated, pad_t, pad_b, pad_l, pad_r,
-            cv2.BORDER_REPLICATE,
-        )
-        x1 += pad_l
-        x2 += pad_l
-        y1 += pad_t
-        y2 += pad_t
+    eye_center = (
+        (left_eye[0] + right_eye[0]) / 2,
+        (left_eye[1] + right_eye[1]) / 2,
+    )
+    current_eye_dist = math.sqrt(dx**2 + dy**2)
+    target_eye_dist = IMG_SIZE * 0.35
+    scale = target_eye_dist / current_eye_dist
+    scale = max(0.25, min(4.0, scale))  # Clamp to avoid extreme zooms
 
-    x1 = max(0, int(x1))
-    y1 = max(0, int(y1))
-    cropped = rotated[y1:y1 + IMG_SIZE, x1:x1 + IMG_SIZE]
-    if cropped.shape[0] != IMG_SIZE or cropped.shape[1] != IMG_SIZE:
-        cropped = cv2.resize(cropped, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LANCZOS4)
-    return cropped
+    M = cv2.getRotationMatrix2D(eye_center, angle, scale)
+    nose_pt = np.array([[nose[0], nose[1], 1.0]])
+    rotated_nose = (M @ nose_pt.T).flatten()[:2]
+
+    target_nose = (IMG_SIZE / 2, IMG_SIZE * 0.4)
+    M[0, 2] += target_nose[0] - rotated_nose[0]
+    M[1, 2] += target_nose[1] - rotated_nose[1]
+
+    aligned = cv2.warpAffine(
+        image, M, (IMG_SIZE, IMG_SIZE),
+        flags=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+    return aligned
 
 
 def _phase_timeframe_from_rel(rel: Path) -> tuple[str, str]:
